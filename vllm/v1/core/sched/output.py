@@ -9,6 +9,8 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorMetadata)
     from vllm.lora.request import LoRARequest
     from vllm.multimodal.inputs import MultiModalKwargs, PlaceholderRange
     from vllm.sampling_params import SamplingParams
@@ -122,6 +124,7 @@ class SchedulerOutput:
     # the bitmask for the whole batch
     grammar_bitmask: Optional[npt.NDArray[np.int32]]
 
+
     # Block swap maps for the current scheduling step.
     # CPU block ID -> GPU block ID
     h2d_swap_map: dict[int, int]
@@ -131,3 +134,7 @@ class SchedulerOutput:
     f2d_swap_map: dict[int, int]
     # CPU block ID -> SSD block ID
     h2f_swap_map: dict[int, int]
+
+    # KV Cache Connector metadata.
+    kv_connector_metadata: Optional[KVConnectorMetadata] = None
+
