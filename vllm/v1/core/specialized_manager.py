@@ -32,7 +32,8 @@ class SpecializedManager(ABC):
 
     @abstractmethod
     def find_longest_cache_hit(
-            self, block_hashes: list[BlockHashType]) -> list[KVCacheBlock]:
+            self, block_hashes: list[BlockHashType]
+            ) -> tuple[list[KVCacheBlock], list[KVCacheBlock], list[KVCacheBlock]]:
         """
         Get the longest cache hit prefix of the blocks. If no cache hit is 
         found, return an empty list.
@@ -69,17 +70,24 @@ class SpecializedManager(ABC):
 class FullAttentionManager(SpecializedManager):
 
     def find_longest_cache_hit(
-            self, block_hashes: list[BlockHashType]) -> list[KVCacheBlock]:
+            self, block_hashes: list[BlockHashType]
+            ) -> tuple[list[KVCacheBlock], list[KVCacheBlock], list[KVCacheBlock]]:
         computed_blocks: list[KVCacheBlock] = []
+        computed_cpu_blocks: list[KVCacheBlock] = []
+        computed_ssd_blocks: list[KVCacheBlock] = []
         for block_hash in block_hashes:
             # block_hashes is a chain of block hashes. If a block hash is not
             # in the cached_block_hash_to_id, the following block hashes are
             # not computed yet for sure.
             if cached_block := self.block_pool.get_cached_block(block_hash):
                 computed_blocks.append(cached_block)
+            elif cached_cpu_block := self.block_pool.get_cached_cpu_block(block_hash):
+                computed_cpu_blocks.append(cached_cpu_block)
+            elif cached_ssd_block := self.block_pool.get_cached_ssd_block(block_hash):
+                computed_ssd_blocks.append(cached_ssd_block)
             else:
                 break
-        return computed_blocks
+        return computed_blocks, computed_cpu_blocks, computed_ssd_blocks
 
     def remove_skipped_blocks(self, blocks: list[KVCacheBlock],
                               num_computed_tokens: int) -> list[KVCacheBlock]:

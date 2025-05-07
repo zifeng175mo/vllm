@@ -140,6 +140,12 @@ class KVCacheConfig:
     """
     """The number of KV cache blocks"""
     num_blocks: int
+    """The number of CPU KV cache blocks"""
+    num_cpu_blocks: int
+    """The number of SSD KV cache blocks"""
+    num_ssd_blocks: int
+    """The file directory path of SSD KV caches"""
+    ssd_dir: str
     """layer_name -> how to initialize KV cache for that layer"""
     tensors: dict[str, KVCacheTensor]
     """

@@ -250,6 +250,10 @@ class Worker(WorkerBase):
             self.profiler.start()
         else:
             self.profiler.stop()
+    
+    def swap_blocks(self, h2d_map: dict[int, int], d2h_map: dict[int, int],
+                    f2d_map: dict[int, int], h2f_map: dict[int, int]) -> None:
+        self.model_runner.swap_blocks(h2d_map, d2h_map, f2d_map, h2f_map)
 
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1)

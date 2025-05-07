@@ -86,6 +86,10 @@ class Executor(ExecutorBase):
         output = self.collective_rpc("execute_model",
                                      args=(scheduler_output, ))
         return output[0]
+    
+    def swap_blocks(self, h2d_map: dict[int, int], d2h_map: dict[int, int],
+                    f2d_map: dict[int, int], h2f_map: dict[int, int]) -> None:
+        self.collective_rpc("swap_blocks", args=(h2d_map, d2h_map, f2d_map, h2f_map))
 
     @property
     def max_concurrent_batches(self) -> int:

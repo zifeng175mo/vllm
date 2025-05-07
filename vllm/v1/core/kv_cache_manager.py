@@ -34,6 +34,9 @@ class KVCacheManager:
         kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
         self.block_size = kv_cache_spec.block_size
         self.num_gpu_blocks = kv_cache_config.num_blocks
+        self.num_gpu_blocks = 128
+        self.num_cpu_blocks = kv_cache_config.num_cpu_blocks
+        self.num_ssd_blocks = kv_cache_config.num_ssd_blocks
         self.max_model_len = max_model_len
         self.max_num_blocks_per_req = cdiv(max_model_len, self.block_size)
 
@@ -56,7 +59,8 @@ class KVCacheManager:
         self.num_preallocate_blocks = cdiv(num_preallocate_tokens,
                                            self.block_size)
 
-        self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
+        self.block_pool = BlockPool(self.num_gpu_blocks, self.num_cpu_blocks,
+                                    self.num_ssd_blocks, enable_caching)
 
         self.specialized_manager = get_specialized_manager(
             kv_cache_spec=kv_cache_spec,
@@ -103,7 +107,8 @@ class KVCacheManager:
         return stats
 
     def get_computed_blocks(
-            self, request: Request) -> tuple[list[KVCacheBlock], int]:
+            self, request: Request) -> tuple[list[KVCacheBlock], list[KVCacheBlock],
+                                             list[KVCacheBlock], int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
 
@@ -112,12 +117,14 @@ class KVCacheManager:
 
         Returns:
             A tuple containing:
-                - A list of blocks that are computed for the request.
+                - A list of GPU blocks that are computed for the request.
+                - A list of CPU blocks that are computed for the request.
+                - A list of SSD blocks that are computed for the request.
                 - The number of computed tokens.
         """
         if not self.enable_caching:
             # Prefix caching is disabled.
-            return [], 0
+            return [], [], [], 0
 
         # The block hashes for the request may already be computed
         # if the scheduler has tried to schedule the request before.
@@ -132,7 +139,7 @@ class KVCacheManager:
             self.prefix_cache_stats.requests += 1
         # When the request requires prompt logprobs, we skip prefix caching.
         if request.sampling_params.prompt_logprobs is not None:
-            return [], 0
+            return [], [], [], 0
 
         if len(block_hashes) * self.block_size == request.num_tokens:
             # When prompt length is divisible by the block size and all
@@ -146,13 +153,13 @@ class KVCacheManager:
             last_block_hash = block_hashes.pop()
         else:
             last_block_hash = None
-
-        computed_blocks = (
+        computed_blocks, computed_cpu_blocks, computed_ssd_blocks = (
             self.specialized_manager.find_longest_cache_hit(block_hashes))
-        if self.log_stats:
-            assert self.prefix_cache_stats is not None
-            self.prefix_cache_stats.queries += len(block_hashes)
-            self.prefix_cache_stats.hits += len(computed_blocks)
+        self.prefix_cache_stats.queries += len(block_hashes)
+        self.prefix_cache_stats.hits += len(computed_blocks)
+        # print(f"computed_cpu_blocks: {len(computed_cpu_blocks)}")
+        self.prefix_cache_stats.hits += len(computed_cpu_blocks)
+        self.prefix_cache_stats.hits += len(computed_ssd_blocks)
 
         if last_block_hash is not None:
             # Add back the last block hash if it was removed.
@@ -163,14 +170,17 @@ class KVCacheManager:
         # NOTE(woosuk): Since incomplete blocks are not eligible for
         # sharing, `num_computed_tokens` is always a multiple of
         # `block_size`.
-        num_computed_tokens = len(computed_blocks) * self.block_size
-        return computed_blocks, num_computed_tokens
+        num_computed_tokens = (len(computed_blocks) + len(computed_cpu_blocks) 
+                               + len(computed_ssd_blocks)) * self.block_size
+        return computed_blocks, computed_cpu_blocks, computed_ssd_blocks, num_computed_tokens
 
     def allocate_slots(
         self,
         request: Request,
         num_tokens: int,
         new_computed_blocks: Optional[list[KVCacheBlock]] = None,
+        new_computed_cpu_blocks: Optional[list[KVCacheBlock]] = None,
+        new_computed_ssd_blocks: Optional[list[KVCacheBlock]] = None,
         num_lookahead_tokens: int = 0,
     ) -> Optional[list[KVCacheBlock]]:
         """Add slots for a request with new tokens to append.
@@ -182,6 +192,10 @@ class KVCacheManager:
                 already been computed locally (i.e. new_computed_blocks).
             new_computed_blocks: A list of new computed blocks just hitting the
                 prefix caching.
+            new_computed_cpu_blocks: A list of new computed CPU blocks just
+                hitting the prefix caching.
+            new_computed_ssd_blocks: A list of new computed SSD blocks just
+                hitting the prefix caching.
             num_lookahead_tokens: The number of speculative tokens to allocate.
                 This is used by spec decode proposers with kv-cache such 
                 as eagle.
@@ -205,6 +219,8 @@ class KVCacheManager:
             raise ValueError("num_tokens must be greater than 0")
 
         new_computed_blocks = new_computed_blocks or []
+        new_computed_cpu_blocks = new_computed_cpu_blocks or []
+        new_computed_ssd_blocks = new_computed_ssd_blocks or []
 
         req_blocks = self.req_to_blocks[request.request_id]
 
@@ -220,11 +236,12 @@ class KVCacheManager:
 
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
-        num_computed_tokens = (request.num_computed_tokens +
-                               len(new_computed_blocks) * self.block_size)
-        num_required_blocks = cdiv(
-            num_computed_tokens + num_tokens + num_lookahead_tokens,
-            self.block_size)
+        total_tokens = (
+            request.num_computed_tokens +
+            (len(new_computed_blocks) + len(new_computed_cpu_blocks)
+             + len(new_computed_ssd_blocks)) *
+            self.block_size + num_tokens)
+        num_required_blocks = cdiv(total_tokens, self.block_size)
         num_new_blocks = (num_required_blocks - len(req_blocks) -
                           len(new_computed_blocks))
 
@@ -277,7 +294,11 @@ class KVCacheManager:
 
         if not self.enable_caching:
             return new_blocks
-
+        # todo
+        swap_in = True
+        if swap_in:
+            self.block_pool.swap_update(new_computed_blocks, new_computed_cpu_blocks, 
+                                    new_computed_ssd_blocks, new_blocks)
         # Use `new_computed_blocks` for a new request, and `num_cached_block`
         # for a running request.
         num_cached_blocks = self.num_cached_block.get(request.request_id,
@@ -285,9 +306,8 @@ class KVCacheManager:
         # Speculated tokens might be rejected in the future, so we does
         # not cache any speculated tokens. We only cache blocks with
         # generated (accepted) tokens.
-        num_full_blocks_after_append = (num_computed_tokens + num_tokens - len(
-            request.spec_token_ids)) // self.block_size
-
+        num_full_blocks_after_append = (
+            total_tokens - len(request.spec_token_ids)) // self.block_size
         self.block_pool.cache_full_blocks(
             request=request,
             blocks=req_blocks,
@@ -392,3 +412,28 @@ class KVCacheManager:
         is finished, not when it is preempted.
         """
         self.req_to_block_hashes.pop(request.request_id, None)
+
+    def end_schedule_step(self) -> None:
+        """A callback hook that is called when a scheduling step ends."""
+        self.block_pool.step_h2d_swap_map.clear()
+        self.block_pool.step_d2h_swap_map.clear()
+        self.block_pool.step_cpu_block_in_use.clear()
+        self.block_pool.step_f2d_swap_map.clear()
+        self.block_pool.step_h2f_swap_map.clear()
+        self.block_pool.step_ssd_block_in_use.clear()
+
+    def get_h2d_map(self) -> dict[int, int]:
+        """Get the H2D map for the current step."""
+        return self.block_pool.step_h2d_swap_map
+
+    def get_d2h_map(self) -> dict[int, int]:
+        """Get the D2H map for the current step."""
+        return self.block_pool.step_d2h_swap_map
+
+    def get_h2f_map(self) -> dict[int, int]:
+        """Get the H2F map for the current step."""
+        return self.block_pool.step_h2f_swap_map
+    
+    def get_f2d_map(self) -> dict[int, int]:
+        """Get the F2D map for the current step."""
+        return self.block_pool.step_f2d_swap_map

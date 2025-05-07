@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
+import atexit
 import gc
 import time
 import weakref
@@ -29,7 +31,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         GiB_bytes, LayerBlockType, LazyLoader, cdiv,
                         check_use_alibi, is_pin_memory_available)
-from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend, FlashAttentionMetadata
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (AttentionSpec, FullAttentionSpec,
                                         KVCacheConfig, KVCacheSpec,
@@ -47,7 +49,7 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 from .utils import (gather_mm_placeholders, sanity_check_mm_encoder_outputs,
-                    scatter_mm_placeholders)
+                    scatter_mm_placeholders, biload_blocks)
 
 if TYPE_CHECKING:
     import xgrammar as xgr
@@ -76,6 +78,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculative_config = vllm_config.speculative_config
         self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
+        self._mmaps = []
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
         set_cpu_offload_max_bytes(
@@ -156,6 +159,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Lazy initialization
         # self.model: nn.Module  # Set after load_model
         self.kv_caches: list[torch.Tensor] = []
+        self.cpu_kv_caches: list[torch.Tensor] = []
+        self.ssd_kv_caches: list[torch.Tensor] = []
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: dict[str, dict[int, torch.Tensor]] = {}
 
@@ -1656,13 +1661,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "supported yet.")
 
         kv_caches: dict[str, torch.Tensor] = {}
-
+        cpu_kv_caches: dict[str, torch.Tensor] = {}
+        ssd_kv_caches: dict[str, torch.Tensor] = {}
+        
         for kv_cache_group in kv_cache_config.kv_cache_groups:
             kv_cache_spec = kv_cache_group.kv_cache_spec
             for layer_name in kv_cache_group.layer_names:
                 tensor_config = kv_cache_config.tensors[layer_name]
                 assert tensor_config.size % kv_cache_spec.page_size_bytes == 0
                 num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
+                num_cpu_blocks = kv_cache_config.num_cpu_blocks
+                num_ssd_blocks = kv_cache_config.num_ssd_blocks
                 # `num_blocks` is the number of blocks the model runner can use.
                 # `kv_cache_config.num_blocks` is the number of blocks that
                 # KVCacheManager may allocate.
@@ -1672,6 +1681,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # the min of all `num_blocks`. Verify it here.
                 assert num_blocks >= kv_cache_config.num_blocks
                 if isinstance(kv_cache_spec, AttentionSpec):
+                    # （2, num_blocks, block_size, kv_head, head_size）
                     kv_cache_shape = self.attn_backend.get_kv_cache_shape(
                         num_blocks, kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
@@ -1679,6 +1689,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     kv_caches[layer_name] = torch.zeros(kv_cache_shape,
                                                         dtype=dtype,
                                                         device=self.device)
+
+                    cpu_kv_cache_shape = self.attn_backend.get_kv_cache_shape(
+                    num_cpu_blocks + 1, kv_cache_spec.block_size,
+                    kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                    dtype = kv_cache_spec.dtype
+                    cpu_kv_caches[layer_name] = torch.zeros(cpu_kv_cache_shape,
+                                                            dtype=dtype,
+                                                            device="cpu",
+                                                            pin_memory=True)
+                    ssd_shape = self.attn_backend.get_kv_cache_shape(
+                        num_ssd_blocks, kv_cache_spec.block_size,
+                        kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
+                    n_elems = int(np.prod(ssd_shape))
+                    dtype = kv_cache_spec.dtype
+                    np_dtype  = {torch.float32: np.float32,
+                                torch.float16: np.float16,
+                                torch.bfloat16: np.float16  # bfloat16 不一定受 numpy 支持
+                                }[dtype]
+                    file_path = os.path.join(kv_cache_config.ssd_dir,
+                                            f"kv_{layer_name}.dat")
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    try:
+                        fd = os.open(file_path, os.O_RDWR | os.O_CREAT)
+                        os.posix_fallocate(fd, 0, n_elems * np_dtype().itemsize)
+                        os.close(fd)
+                    except AttributeError:
+                        # If system doesn't support posix_fallocate，use truncate instead
+                        with open(file_path, "wb") as f:
+                            f.truncate(n_elems * np_dtype().itemsize)
+                    np_arr = np.memmap(
+                        filename = file_path,
+                        dtype    = np_dtype,
+                        mode     = "r+",
+                        shape    = tuple(ssd_shape)
+                    )
+                    ssd_kv_caches[layer_name] = torch.from_numpy(np_arr)
+                    self._mmaps.append((np_arr, file_path))
+
                 else:
                     # TODO: add new branches when introducing more types of
                     # KV cache specs.
@@ -1686,8 +1735,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         bind_kv_cache(
             kv_caches,
+            cpu_kv_caches,
+            ssd_kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
-            self.kv_caches)
+            self.kv_caches,
+            self.cpu_kv_caches,
+            self.ssd_kv_caches,)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """
@@ -1736,3 +1789,54 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     f"Unknown attention type: {attn_module.attn_type}")
 
         return kv_cache_spec
+
+    def swap_blocks(self, h2d_map: dict[int, int], d2h_map: dict[int, int],
+                    f2d_map: dict[int, int], h2f_map: dict[int, int]) -> None:
+        """
+        Swap blocks between CPU and GPU. Both h2d and d2h calls are issued
+        to the same steam with the former issued first.
+        Args:
+            h2d_map: A dictionary mapping CPU block IDs to GPU block IDs.
+            d2h_map: A dictionary mapping GPU block IDs to CPU block IDs.
+            f2d_map: A dictionary mapping SSD block IDs to GPU block IDs.
+            h2f_map: A dictionary mapping CPU block IDs to SSD block IDs.
+        """
+        # Apply swap_blocks to every layer.
+        if len(h2f_map) != 0:
+            # print("CPU swap out")
+            h2f_map = torch.tensor(list(h2f_map.items()), device="cpu")
+            for src_tensor, dst_tensor in zip(self.cpu_kv_caches,
+                                              self.ssd_kv_caches):
+                biload_blocks(src_tensor, dst_tensor, h2f_map)
+                dst_tensor.flush()
+        
+        # Device to host.
+        if len(d2h_map) != 0:
+            # print("GPU swap out")
+            d2h_map = torch.tensor(list(d2h_map.items()), device="cpu")
+            for src_tensor, dst_tensor in zip(self.kv_caches,
+                                              self.cpu_kv_caches):
+                FlashAttentionBackend.swap_blocks(src_tensor, dst_tensor,
+                                                  d2h_map)
+
+        if len(f2d_map) != 0:
+            # print("SSD swap in")
+            f2d_map = torch.tensor(list(f2d_map.items()), device="cpu")
+            cpu_blockid = len(self.cpu_kv_caches)
+            for gpu_tensor, cpu_tensor, ssd_tensor in zip(self.kv_caches, self.cpu_kv_caches, self.ssd_kv_caches):
+                for ssd, gpu in enumerate(f2d_map):
+                    f2h_map = {}
+                    temp_map = {}
+                    f2h_map[ssd] = cpu_blockid
+                    biload_blocks(ssd_tensor, cpu_tensor, f2h_map)
+                    temp_map[cpu_blockid] = gpu
+                    FlashAttentionBackend.swap_blocks(cpu_tensor, gpu_tensor, temp_map)
+
+        # Host to device.
+        if len(h2d_map) != 0:
+            # print("CPU swap in")
+            h2d_map_t = torch.tensor(list(h2d_map.items()), device="cpu")
+            for src_tensor, dst_tensor in zip(self.cpu_kv_caches,
+                                              self.kv_caches):
+                FlashAttentionBackend.swap_blocks(src_tensor, dst_tensor,
+                                                  h2d_map_t)
