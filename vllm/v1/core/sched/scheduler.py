@@ -302,7 +302,7 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 # Get already-cached tokens.
-                computed_blocks, num_computed_tokens = \
+                computed_blocks, computed_cpu_blocks, computed_ssd_blocks, num_computed_tokens = \
                     self.kv_cache_manager.get_computed_blocks(request)
                 # Number of tokens to be scheduled.
                 # We use `request.num_tokens` instead of
@@ -330,7 +330,7 @@ class Scheduler(SchedulerInterface):
                     new_encoder_budget = encoder_budget
 
                 new_blocks = self.kv_cache_manager.allocate_slots(
-                    request, num_new_tokens, computed_blocks)
+                    request, num_new_tokens, computed_blocks, computed_cpu_blocks, computed_ssd_blocks,)
                 if new_blocks is None:
                     # The request cannot be scheduled.
                     break
@@ -356,7 +356,10 @@ class Scheduler(SchedulerInterface):
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
                 req_to_new_block_ids[request.request_id] = [
-                    b.block_id for b in computed_blocks + new_blocks
+                    b.block_id for b in (computed_blocks 
+                                        + computed_cpu_blocks 
+                                        + computed_ssd_blocks
+                                        + new_blocks)
                 ]
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 token_budget -= num_new_tokens
@@ -441,6 +444,10 @@ class Scheduler(SchedulerInterface):
             free_encoder_input_ids=self.encoder_cache_manager.get_freed_ids(),
             structured_output_request_ids=structured_output_request_ids,
             grammar_bitmask=grammar_bitmask,
+            h2d_swap_map=self.kv_cache_manager.get_h2d_map(),
+            d2h_swap_map=self.kv_cache_manager.get_d2h_map(),
+            f2d_swap_map=self.kv_cache_manager.get_f2d_map(),
+            h2f_swap_map=self.kv_cache_manager.get_h2f_map(),
         )
 
         # Advance the number of computed tokens for the request AFTER
@@ -457,6 +464,9 @@ class Scheduler(SchedulerInterface):
 
         self.finished_req_ids = set()
         return scheduler_output
+
+    def reset_maps(self) -> None:
+        self.kv_cache_manager.end_schedule_step()
 
     def _make_cached_request_data(
         self,

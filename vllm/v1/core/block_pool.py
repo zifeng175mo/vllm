@@ -26,13 +26,23 @@ class BlockPool:
         enable_caching: Whether to enable prefix caching.
     """
 
-    def __init__(self, num_gpu_blocks: int, enable_caching: bool):
+    def __init__(self, num_gpu_blocks: int, num_cpu_blocks: int, 
+                 num_ssd_blocks: int, enable_caching: bool):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
+        self.num_cpu_blocks = num_cpu_blocks
+        self.num_ssd_blocks = num_ssd_blocks
         self.enable_caching = enable_caching
-        # All kv-cache blocks.
+        # All kv-cached blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
+        ]
+        # All kv-cached cpu blocks
+        self.cpu_blocks: list[KVCacheBlock] = [
+            KVCacheBlock(idx) for idx in range(num_cpu_blocks)
+        ]
+        self.ssd_blocks: list[KVCacheBlock] = [
+            KVCacheBlock(idx) for idx in range(num_ssd_blocks)
         ]
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
@@ -50,11 +60,40 @@ class BlockPool:
         # block tables are append-only.
         self.cached_block_hash_to_block: dict[BlockHashType, dict[
             int, KVCacheBlock]] = defaultdict(dict)
-
+        
+        # {block_hash: block}. This is used to quickly find the CPU block
+        self.cached_block_hash_to_cpu_block: dict[BlockHashType,
+                                            KVCacheBlock] = {}
+        # {block_hash: block}. This is used to quickly find the SSD block
+        self.cached_block_hash_to_ssd_block: dict[BlockHashType,
+                                            KVCacheBlock] = {}
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
         self.null_block = self.free_block_queue.popleft()
+
+        # The next possible available cpu block id for swapping.
+        self.next_available_cpu_block_id = 0
+        
+        # The next possible available ssd block id for swapping.
+        self.next_available_ssd_block_id = 0
+
+        # The following swap maps are accumulated over a scheduling step.
+        # Then they are "flushed" as part of the scheduler output.
+        # CPU block ID -> GPU block ID
+        self.step_h2d_swap_map: dict[int, int] = {}
+        # GPU block ID -> CPU block ID
+        self.step_d2h_swap_map: dict[int, int] = {}
+        # SSD block ID -> GPU block ID
+        self.step_f2d_swap_map: dict[int, int] = {}
+        # CPU block ID -> SSD block ID
+        self.step_h2f_swap_map: dict[int, int] = {}
+        # CPU blocks in use in this scheduling step i.e. source block for
+        # swap-in and destination block for swap-out.
+        self.step_cpu_block_in_use: set[int] = set()
+        # SSD blocks in use in this scheduling step i.e. source block for
+        # swap-in and destination block for swap-out.
+        self.step_ssd_block_in_use: set[int] = set()
 
     def get_cached_block(self,
                          block_hash: BlockHashType) -> Optional[KVCacheBlock]:
@@ -72,6 +111,36 @@ class BlockPool:
             return None
         first_block_id = next(iter(cached_blocks))
         return cached_blocks[first_block_id]
+
+    def get_cached_cpu_block(self, block_hash: BlockHashType) -> Optional[KVCacheBlock]:
+        """Get a cached CPU block by the block hash, or None if cache miss.
+        Note that there are no duplicated blocks in CPU.
+
+        Args:
+            block_hash: The hash value of the block.
+
+        Returns:
+            The cached block if it exists, or None.
+        """
+        cached_block = self.cached_block_hash_to_cpu_block.get(block_hash)
+        if not cached_block:
+            return None
+        return cached_block
+
+    def get_cached_ssd_block(self, block_hash: BlockHashType) -> Optional[KVCacheBlock]:
+        """Get a cached SSD block by the block hash, or None if cache miss.
+        Note that there are no duplicated blocks in SSD.
+
+        Args:
+            block_hash: The hash value of the block.
+
+        Returns:
+            The cached block if it exists, or None.
+        """
+        cached_block = self.cached_block_hash_to_ssd_block.get(block_hash)
+        if not cached_block:
+            return None
+        return cached_block
 
     def cache_full_blocks(
         self,
@@ -177,9 +246,10 @@ class BlockPool:
             curr_block = self.free_block_queue.popleft()
             assert curr_block.ref_cnt == 0
 
-            # If the block is cached, evict it.
+            # If the block is cached, evict it because it's not useful now.
+            # todo get_new_gpu_blocks -> _maybe_evict_cached_block -> get_new_cpu_block -> ssd
             if self.enable_caching:
-                self._maybe_evict_cached_block(curr_block)
+                self._maybe_evict_cached_block(curr_block, swap_out=True)
 
             curr_block.incr_ref()
             ret.append(curr_block)
@@ -187,19 +257,31 @@ class BlockPool:
 
         return ret
 
-    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+    def _maybe_evict_cached_block(self, block: KVCacheBlock, swap_out: bool = False) -> bool:
         """
         If a block is cached in `cached_block_hash_to_block`, we reset its hash
         metadata and evict it from the cache.
 
         Args:
             block: The block to evict.
+            swap_out: Whether to swap out the block to cpu cache.
 
         Returns:
             True if the block is evicted, False otherwise.
         """
         block_hash = block.block_hash
         if block_hash and block_hash in self.cached_block_hash_to_block:
+            if (swap_out
+                    and block_hash not in self.cached_block_hash_to_cpu_block
+                    and (target_cpu_block := self._get_new_cpu_block())):
+                target_cpu_block_id = target_cpu_block.block_id
+                self.step_d2h_swap_map[block.block_id] = target_cpu_block_id
+                self.step_cpu_block_in_use.add(target_cpu_block_id)
+                self.cpu_blocks[
+                    target_cpu_block_id].block_hash = block_hash
+                self.cached_block_hash_to_cpu_block[block_hash] = (
+                    self.cpu_blocks[target_cpu_block_id])
+
             block.reset_hash()
             del self.cached_block_hash_to_block[block_hash][block.block_id]
 
@@ -208,6 +290,95 @@ class BlockPool:
 
             return True
         return False
+
+    def _get_new_cpu_block(self) -> Optional[KVCacheBlock]:
+        """Get a new cpu block from the cpu block pool, evict
+        it from the cpu cache if it is cached.
+        Todo: Now round robin. Implement LRU policy later.
+        Returns:
+            A new cpu block, or None if all cpu blocks are used.
+        """
+        if len(self.step_cpu_block_in_use) == len(self.cpu_blocks):
+            return None
+
+        while self.next_available_cpu_block_id in self.step_cpu_block_in_use:
+            self.next_available_cpu_block_id = (
+                self.next_available_cpu_block_id + 1) % len(
+                    self.cpu_blocks)
+
+        block_id = self.next_available_cpu_block_id
+        self.next_available_cpu_block_id = (self.next_available_cpu_block_id +
+                                            1) % len(self.cpu_blocks)
+
+        # Evict the cpu block if it is cached.
+        # todo swap out the block to SSD.
+        block_hash = self.cpu_blocks[block_id].block_hash
+        swap_out = False
+        if block_hash:
+            if (block_hash in self.cached_block_hash_to_cpu_block and swap_out and block_hash not in self.cached_block_hash_to_ssd_block
+                    and (target_ssd_block := self._get_new_ssd_block())):
+                target_ssd_block_id = target_ssd_block.block_id
+                self.step_h2f_swap_map[block_id] = target_ssd_block_id
+                self.step_ssd_block_in_use.add(target_ssd_block_id)
+                self.ssd_blocks[
+                    target_ssd_block_id].block_hash = block_hash
+                self.cached_block_hash_to_ssd_block[block_hash] = (
+                    self.ssd_blocks[target_ssd_block_id])
+
+            del self.cached_block_hash_to_cpu_block[block_hash]
+            self.cpu_blocks[block_id].reset_hash()
+
+        return self.cpu_blocks[block_id]
+    
+    def _get_new_ssd_block(self) -> Optional[KVCacheBlock]:
+        """Get a new ssd block from the ssd block pool, evict
+        it from the ssd cache if it is cached.
+        Returns:
+            A new ssd block, or None if all ssd blocks are used.
+        """
+        if len(self.step_ssd_block_in_use) == len(self.ssd_blocks):
+            return None
+
+        while self.next_available_ssd_block_id in self.step_ssd_block_in_use:
+            self.next_available_ssd_block_id = (
+                self.next_available_ssd_block_id + 1) % len(
+                    self.ssd_blocks)
+
+        target_ssd_block_id = self.next_available_ssd_block_id
+        self.next_available_ssd_block_id = (self.next_available_ssd_block_id +
+                                            1) % len(self.ssd_blocks)
+
+        # Evict the ssd block if it is cached.
+        block_hash = self.ssd_blocks[target_ssd_block_id].block_hash
+        if block_hash is not None:
+            del self.cached_block_hash_to_ssd_block[block_hash]
+            self.ssd_blocks[target_ssd_block_id].reset_hash()
+
+        return self.ssd_blocks[target_ssd_block_id]
+    
+    def swap_update(self, new_computed_blocks: list[KVCacheBlock],
+        new_computed_cpu_blocks: list[KVCacheBlock], 
+        new_computed_ssd_blocks: list[KVCacheBlock],
+        new_blocks: list[KVCacheBlock]) -> None:
+        assert (len(new_computed_cpu_blocks) + len(new_computed_ssd_blocks) < len(new_blocks)
+                if new_computed_blocks else True)
+        self.step_h2d_swap_map.update({
+            cpu_block.block_id: new_block.block_id
+            for cpu_block, new_block in zip(new_computed_cpu_blocks,
+                                            new_blocks)
+        })
+        new_blocks = new_blocks[len(new_computed_cpu_blocks):]
+        self.step_f2d_swap_map.update({
+            ssd_block.block_id: new_block.block_id
+            for ssd_block, new_block in zip(new_computed_ssd_blocks,
+                                            new_blocks)
+        })
+        self.step_cpu_block_in_use.update(
+            {cpu_block.block_id
+             for cpu_block in new_computed_cpu_blocks})
+        self.step_ssd_block_in_use.update(
+            {ssd_block.block_id
+             for ssd_block in new_computed_ssd_blocks})
 
     def touch(self, blocks: list[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove

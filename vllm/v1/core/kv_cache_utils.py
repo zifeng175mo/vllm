@@ -414,6 +414,7 @@ def hash_block_tokens(
         parent_block_hash = NONE_HASH
 
     curr_block_token_ids_tuple = tuple(curr_block_token_ids)
+    # print(parent_block_hash, curr_block_token_ids_tuple, extra_keys, curr_block_token_ids_tuple, extra_keys)
     return BlockHashType(
         hash_function(
             (parent_block_hash, curr_block_token_ids_tuple, extra_keys)),
@@ -600,7 +601,9 @@ def is_kv_cache_type_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
 
 def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
                                       kv_cache_spec: dict[str, KVCacheSpec],
-                                      available_memory: int) -> KVCacheConfig:
+                                      available_memory: int,
+                                      available_cpu_swap_memory: int,
+                                      available_ssd_swap_memory: int) -> KVCacheConfig:
     """
     Generates the KV cache configuration for a model with one type of KV cache.
     Divide the available memory equally among all layers.
@@ -609,6 +612,8 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
         vllm_config: The global VllmConfig
         kv_cache_spec: The kv cache spec of each attention layer in the model
         available_memory: Memory available for KV cache in bytes.
+        available_cpu_swap_memory: CPU Memory available for swap in bytes.
+        available_ssd_swap_memory: SSD Memory available for swap in bytes.
 
     Returns:
         The generated KVCacheConfig
@@ -621,6 +626,12 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     num_blocks = int(available_memory // page_size // len(kv_cache_spec))
     num_blocks = max(num_blocks, 0)
 
+    num_cpu_blocks = int(available_cpu_swap_memory // page_size // len(kv_cache_spec))
+    num_cpu_blocks = max(num_cpu_blocks, 0)
+
+    num_ssd_blocks = int(available_ssd_swap_memory // page_size // len(kv_cache_spec))
+    num_ssd_blocks = max(num_ssd_blocks, 0)
+
     if vllm_config.cache_config.num_gpu_blocks_override is not None:
         num_gpu_blocks_override = \
             vllm_config.cache_config.num_gpu_blocks_override
@@ -630,8 +641,12 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
         num_blocks = num_gpu_blocks_override
 
     num_tokens = num_blocks * vllm_config.cache_config.block_size
-    num_tokens_str = f"{num_tokens:,}"
-    logger.info("GPU KV cache size: %s tokens", num_tokens_str)
+    num_cpu_tokens = num_cpu_blocks * vllm_config.cache_config.block_size
+    num_ssd_tokens = num_ssd_blocks * vllm_config.cache_config.block_size
+    logger.info("GPU KV cache size: %s tokens", f"{num_tokens:,}")
+    logger.info("CPU KV cache size: %s tokens", f"{num_cpu_tokens:,}")
+    logger.info("SSD KV cache size: %s tokens", f"{num_ssd_tokens:,}")
+
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
     max_concurrency = num_tokens / vllm_config.model_config.max_model_len
     logger.info("Maximum concurrency for %s tokens per request: %.2fx",
@@ -644,6 +659,9 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
 
     kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
+        num_cpu_blocks=num_cpu_blocks,
+        num_ssd_blocks=num_ssd_blocks,
+        ssd_dir="/workspace/ssd_cache",
         tensors={
             layer_name: KVCacheTensor(size=per_layer_size)
             for layer_name in kv_cache_spec
@@ -683,7 +701,9 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
 
 def get_kv_cache_config(vllm_config: VllmConfig,
                         kv_cache_spec: dict[str, KVCacheSpec],
-                        available_memory: int) -> KVCacheConfig:
+                        available_memory: int,
+                        available_cpu_swap_memory: int,
+                        available_ssd_swap_memory: int) -> KVCacheConfig:
     """
     Generates the KV cache configuration for a model
     TODO: support hybrid models with more than one type of KV cache.
@@ -692,6 +712,8 @@ def get_kv_cache_config(vllm_config: VllmConfig,
         vllm_config: The global VllmConfig
         kv_cache_spec: The kv cache spec of each attention layer in the model
         available_memory: Memory available for KV cache in bytes.
+        available_cpu_swap_memory: CPU Memory available for swap in bytes.
+        available_ssd_swap_memory: SSD Memory available for swap in bytes.
 
     Returns:
         The generated KVCacheConfigs
@@ -703,7 +725,9 @@ def get_kv_cache_config(vllm_config: VllmConfig,
         # most models. Allocate the same amount of memory for
         # each layer.
         return _get_kv_cache_config_uniform_type(vllm_config, kv_cache_spec,
-                                                 available_memory)
+                                                 available_memory, 
+                                                 available_cpu_swap_memory,
+                                                 available_ssd_swap_memory)
 
     raise NotImplementedError
 

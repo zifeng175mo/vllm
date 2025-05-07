@@ -72,3 +72,32 @@ def gather_mm_placeholders(
         return placeholders
 
     return placeholders[is_embed]
+
+def biload_blocks(
+    src: torch.Tensor, 
+    dst: torch.Tensor, 
+    block_mapping: torch.Tensor
+) -> None:
+    if src.device.type != 'cpu':
+        raise ValueError(f"src must be on CPU, but got {src.device.type}")
+    if dst.device.type != 'cpu':
+        raise ValueError(f"dst must be on CPU, but got {dst.device.type}")
+    if block_mapping.device.type != 'cpu':
+        raise ValueError("block_mapping must be on CPU")
+
+    src_np = src.numpy().view(np.uint8).ravel()
+    dst_np = dst.numpy().view(np.uint8).ravel()
+
+    block_size = src.element_size() * src.stride(0)
+
+    num_blocks = block_mapping.size(0)
+    for i in range(num_blocks):
+        # copy by block.
+        src_idx = int(block_mapping[i, 0].item())
+        dst_idx = int(block_mapping[i, 1].item())
+        src_start = src_idx * block_size
+        dst_start = dst_idx * block_size
+        if src_start + block_size > src_np.size or dst_start + block_size > dst_np.size:
+            raise IndexError(f"block index out of range: [{src_idx}->{dst_idx}]")
+
+        dst_np[dst_start: dst_start + block_size] = src_np[src_start: src_start + block_size]
